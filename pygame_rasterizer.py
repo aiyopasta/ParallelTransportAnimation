@@ -1,8 +1,16 @@
+# Conclusion: Really, really slow. Even for few triangles. There's likely ways of making it faster, but that's kinda
+# boring to me. I'd rather just start animating stuff now. So let's leave this aside for now, and just get the main
+# animations in. Even if you see tkinter-like animations for debugging, that's fine. You can add the fancy rasterization
+# at export time if you want (it'll be like 1 second per frame for exporting, but who cares).
+#
+# Anyways, good job! You still remember stuff from 560 lol.
+
 import numpy as np
 import os
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
 import pygame
-from numba import njit
+import numba as nb
+from numba.np.extensions import cross2d
 import copy
 
 # Pygame + gameloop setup
@@ -20,13 +28,14 @@ cam_focus = 1000.  # Distance from near clipping plane to eye
 
 # Helper functions
 # 1. Coordinate Shift
-@njit
+@nb.njit
 def A(val):
     return np.array([val[0] + width / 2, -val[1] + height / 2])
 
 
 # 2. Actual perspective projection function
-# TODO: Numba accelerate
+# TODO 1: Numba accelerate
+# TODO 2: Give it a third output, which is just the z coordinate wrt the camera (for z-testing).
 # RECALL THIS GIVES RAW, UN-A'D OUTPUT!
 def world_to_plane(v, rho, theta, phi, focus):
     '''
@@ -68,8 +77,55 @@ def perspective_project(v):
     return world_to_plane(v, cam_rho, cam_theta, cam_phi, cam_focus)
 
 
+# 4. Barycentric coordinates
+@nb.njit
+def barycoords(point, positions):
+    assert len(point) == 2 and len(positions) == 3
+    xy0, xy1, xy2 = positions[0][:-1], positions[1][:-1], positions[2][:-1]
+    total_area = np.abs(cross2d(xy1 - xy0, xy2 - xy0)) / 2
+    coords = np.array([0., 0., 0.])
+    for idx in range(3):
+        p1, p2 = positions[(idx + 1) % 3][:-1], positions[(idx + 2) % 3][:-1]
+        area = np.abs(cross2d(p2 - p1, point - p1)) / 2
+        coords[idx] = area / total_area
+    return coords
+
+
+@nb.njit
+def interpolate_zdepth(point, positions):
+    assert len(point) == 2 and len(positions) == 3
+    coords = barycoords(point, positions)
+    reciprocal = 0.
+    for i in range(3):
+        assert positions[i][-1] >= 1  # smallest z distance is 1 (think about how perspective divide works)
+        reciprocal += coords[i] * (1. / positions[i][-1])
+
+    return 1. / reciprocal
+
+
+# 6. Perspective correct interpolation for arbitrary 3-vector attribute
+@nb.njit
+def interpolate_attributes(point, positions, attributes):
+    assert len(point) == 2 and len(positions) == len(attributes) == 3
+    coords = barycoords(point, positions)
+    summation = np.array([0., 0., 0.])   # we'll only ever have to interpolate 3-vectors, right? RIGHT?
+    for i in range(3):
+        assert positions[i][-1] >= 1  # smallest z distance is 1 (think about how perspective divide works)
+        summation += coords[i] * (1. / positions[i][-1]) * attributes[i]
+
+    return summation * interpolate_zdepth(point, positions)
+
+
+# ___ For testing the above functions
+# point_ = np.array([10., 10.])
+# positions_ = np.array([np.array([0., 0., 1.]), np.array([100., 0., 1.]), np.array([0., 100., 20.])])
+# attributes_ = np.array([np.array([255., 255., 255.]), np.array([255., 255., 255.]), np.array([0., 0., 0.])])
+# print(interpolate_zdepth(point_, positions_))
+
+
+
 # Vertex transformation functions
-@njit
+@nb.njit
 def rot(vertex, theta):
     R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
     return R.dot(vertex)
@@ -106,29 +162,36 @@ class Vertex:
 
     def __init__(self, position, color=None, normal=None):
         self.position = np.array(position)
-        self.normal = np.array(normal)
-        self.color = color if color is None else np.array([1.,1.,1.]) * 255.0
+        self.normal = np.array(normal) if normal is not None else np.array([1.,1.,1.])
+        self.color = np.array(color) if color is not None else np.array([1.,1.,1.]) * 255.0
         self.id = Vertex.new_id
         Vertex.new_id += 1
 
     def raw_data(self, proj=True):
         position = perspective_project(self.position) if proj else self.position
-        return np.array([position, self.normal, self.color, self.id])
+        return position, self.normal, self.color, self.id
 
 
 class Triangle:
     new_id = 0
 
-    def __init__(self, vertices, vertex_cols):
+    def __init__(self, vertices):
         assert len(vertices) == 3
         self.verts = vertices   # list of Vertex objects
-        self.cols = vertex_cols
         self.id = Triangle.new_id
         Triangle.new_id += 1
 
     # Note: NOT A'D!
     def raw_data(self, proj=True):
-        return np.array([v.raw_data(proj) for v in self.verts])
+        positions, normals, colors, IDs = [], [], [], []
+        for v in self.verts:
+            pos, nor, col, ID = v.raw_data(proj)
+            positions.append(pos)
+            normals.append(nor)
+            colors.append(col)
+            IDs.append(ID)
+
+        return np.array(positions), np.array(normals), np.array(colors), np.array(IDs), self.id
 
 
 # And a mesh class... just cleaner.
@@ -142,39 +205,60 @@ class Mesh:
 
     # For Numba functions. Note: NOT A'D!
     def raw_data(self, proj=True):
-        return np.array([face.raw_data(proj) for face in self.facets])
+        all_positions, all_normals, all_colors, all_IDs, all_triangle_IDs = [], [], [], [], []
+        for facet in self.facets:
+            positions, normals, colors, IDs, triangle_id = facet.raw_data(proj)
+            all_positions.append(positions)
+            all_normals.append(normals)
+            all_colors.append(colors)
+            all_IDs.append(IDs)
+            all_triangle_IDs.append(triangle_id)
+
+        return np.array(all_positions), np.array(all_normals), np.array(all_colors), np.array(all_IDs), np.array(all_triangle_IDs), self.id
+
 
 # Let's test all this out by outputting the same 3 triangles as before but in this new format.
 # We can also shade in the triangles differently based on interpolation.
-# TEST 1 —— NO perspective projection
+# TEST 1 —— Single triangle, NO perspective projection
+v1 = Vertex(position=np.array([0., 0., 1.]), color=np.array([255., 0., 0.]))   # Note: Here, third positional coordinate is the z-value. Ideally, this would be returned by the perspective projection function.
+v2 = Vertex(position=np.array([100., 0., 1.]), color=np.array([0., 255., 0.]))
+v3 = Vertex(position=np.array([0., 100., 2.]), color=np.array([0., 0., 255.]))
+v4 = Vertex(position=np.array([-100., 0., 1.]), color=np.array([255., 0., 0.]))
+v5 = Vertex(position=np.array([50., -40., 4.]), color=np.array([0., 0., 255.]))
+v6 = Vertex(position=np.array([0., 200., 2.]), color=np.array([0., 255., 0.]))
+triangle = Triangle(np.array([v1, v2, v3]))
+triangle2 = Triangle(np.array([v4, v5, v6]))
+mesh = Mesh(np.array([triangle, triangle2]))
 
-
-
-
+# Z stuff
 z_buffer = np.ones([width, height]) * float('inf')
 
 # For FPS
 clock = pygame.time.Clock()
 
-@njit
-def rasterize(tri_list, z_vals, colors, z_buff):   # TODO: Ideally: mesh_data, z_buff. mesh_data has triangles, each of which have vertices that each have a color, normal, etc.
+@nb.njit
+def rasterize(positions, normals, colors, z_buff):   # TODO: Ideally: mesh_data, z_buff. mesh_data has triangles, each of which have vertices that each have a color, normal, etc.
     '''
         NOTE: Positions of vertices of triangles must be NON-A'D!!!!
     '''
     RGB = np.zeros((3, height, width), dtype=np.uint8)
-    # 1. Iterate over list of triangles
-    # 2. When you're shading each, compare to the z_buff + update it if necessary
-    for k, tri in enumerate(tri_list):
-        xrange = [min(min(tri[0][0], tri[1][0]), tri[2][0]), max(max(tri[0][0], tri[1][0]), tri[2][0])]
-        yrange = [min(min(tri[0][1], tri[1][1]), tri[2][1]), max(max(tri[0][1], tri[1][1]), tri[2][1])]
+
+    # Iterate over each triangle. Remember, each 'pos' contains 3 vertex positions.
+    for k, pos in enumerate(positions):
+        # Compute bounding box
+        xrange = [min(min(pos[0][0], pos[1][0]), pos[2][0]), max(max(pos[0][0], pos[1][0]), pos[2][0])]
+        yrange = [min(min(pos[0][1], pos[1][1]), pos[2][1]), max(max(pos[0][1], pos[1][1]), pos[2][1])]
+        # Check if non-degenerate
         if abs(xrange[1] - xrange[0]) > 1 and abs(yrange[1] - yrange[0]) > 1:
+            # Iterate row by row over bounding box and find out range of columns to shade
             for row in range(int(yrange[0]), int(yrange[1]), 1):
-                xleft, xright = xrange[1], xrange[
-                    0]  # initialize as left > right, i.e. "do NOT shade any pixels in row"
+                # By default, don't shade any
+                xleft, xright = xrange[1], xrange[0]
+                # Let's see which triangle edges the row intersects, if any to figure it out.
                 r0_row = np.array([xrange[0], row])
                 v_row = np.array([xrange[1], row]) - r0_row
                 for i in range(3):
-                    p0, p1 = tri[i], tri[(i + 1) % 3]
+                    p0, p1 = pos[i][:-1], pos[(i + 1) % 3][:-1] # 3rd entry is the z-value (not needed here)
                     r0_edge = p0
                     v_edge = p1 - p0
                     # Normal, non-degenerate intersection case
@@ -195,16 +279,21 @@ def rasterize(tri_list, z_vals, colors, z_buff):   # TODO: Ideally: mesh_data, z
                             xleft, xright = xright, xleft
                             break
 
-                # Actually shade in all the pixels
+                # Actually shade in the correct pixels (columns) for this row
                 for col in range(int(xleft), int(xright)):
-                    # Overwrite iff this z value is closer than one in buffer.
-                    xy = A(np.array([col, row]))
+                    # Compute interpolated z coordinate for this fragment
+                    raw_point = np.array([col, row])
+                    z_depth = interpolate_zdepth(raw_point, pos)
+                    # Convert to A'd coordinates (as that's what the Z-buffer knows about).
+                    xy = A(raw_point)
                     true_row, true_col = int(xy[1]), int(xy[0])
-                    # TODO: The actual z value for this fragment will have to be perspective-correctly interpolated.
-                    if z_vals[k] < z_buff[true_row][true_col]:
-                        z_buff[true_row][true_col] = z_vals[k]
+                    # Overwrite iff this z value is closer than one in buffer.
+                    if z_depth < z_buff[true_row][true_col]:
+                        z_buff[true_row][true_col] = z_depth
+                        # Get interpolated color
+                        interp_color = interpolate_attributes(raw_point, pos, colors[k])
                         for channel in range(3):  # store separate RGB
-                            RGB[channel][true_row][true_col] = colors[k][channel]
+                            RGB[channel][true_row][true_col] = interp_color[channel]
 
                         # window.set_at(xy, colors[k])
 
@@ -213,22 +302,17 @@ def rasterize(tri_list, z_vals, colors, z_buff):   # TODO: Ideally: mesh_data, z
 
 # Task 2:
 def main():
-    global z_buffer, triangles, z_values, cols, clock  #, tri
+    global z_buffer, mesh, clock
 
     # Game loop
     count = 0
     run = True
     while run:
+        # Reset everything.
         window.fill((0, 0, 0))
-        count += 1
-        z_buffer = np.ones([width, height]) * float('inf')  # reset each frame
+        z_buffer = np.ones([width, height]) * float('inf')
 
-        for i, tri in enumerate(triangles):
-            p0 = triangles[i][0]
-            for j, vert in enumerate(tri):
-                triangles[i][j] = rot(triangles[i][j] - p0, np.pi / 100) + p0
-
-        RGB = rasterize(triangles, z_values, cols, z_buffer)
+        RGB = rasterize(*mesh.raw_data(proj=False)[:3], z_buffer)
         RGB = np.transpose(RGB, (2, 1, 0))
         pygame.surfarray.blit_array(window, RGB)
 
@@ -237,9 +321,10 @@ def main():
         keys_pressed = pygame.key.get_pressed()
         # do stuff....
 
-        # End run (1. Tick clock, 2. Save the frame, and 3. Detect if window closed)
+        # End frame and update everything.
         pygame.display.update()
         fps = clock.tick_busy_loop()
+        count += 1
         print('FPS', int(1000/fps))
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
